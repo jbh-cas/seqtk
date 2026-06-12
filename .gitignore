@@ -2,3 +2,6 @@
 *.a
 *.dSYM
 .*.swp
+seqtk
+test/*.fa
+test/*.err

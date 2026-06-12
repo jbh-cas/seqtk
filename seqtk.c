@@ -1966,21 +1966,95 @@ int stk_size(int argc, char *argv[])
 	return 0;
 }
 
+// Ruzzo-Tompa: maintain all maximal-scoring subsequences of a score stream in linear time.
+typedef struct { int64_t L, R, start, end; } telo_seg_t;
+typedef struct { telo_seg_t *a; int n, m; int64_t prefix; } telo_rt_t;
+
+static void telo_rt_push(telo_rt_t *rt, int s, int64_t pos)
+{
+	telo_seg_t cur;
+	int64_t Lval = rt->prefix;
+	rt->prefix += s;
+	if (s <= 0) return; // only positive scores can begin a maximal subsequence
+	cur.L = Lval, cur.R = rt->prefix, cur.start = cur.end = pos;
+	for (;;) {
+		int j = rt->n - 1;
+		while (j >= 0 && rt->a[j].L >= cur.L) --j; // rightmost seg with L < cur.L
+		if (j < 0 || rt->a[j].R >= cur.R) { // cur cannot extend left across seg j
+			if (rt->n == rt->m) {
+				rt->m = rt->m? rt->m<<1 : 16;
+				rt->a = (telo_seg_t*)realloc(rt->a, rt->m * sizeof(telo_seg_t));
+			}
+			rt->a[rt->n++] = cur;
+			break;
+		} else { // absorb seg j..end into cur and retry
+			cur.L = rt->a[j].L, cur.start = rt->a[j].start;
+			rt->n = j;
+		}
+	}
+}
+
+typedef struct { int64_t start, end, score; int partner; char strand; } telo_out_t; // partner: -1 lone, -2 consumed 'after', >=0 index of 'after' for an annealed junction
+
+static int telo_out_cmp(const void *a, const void *b)
+{
+	const telo_out_t *x = (const telo_out_t*)a, *y = (const telo_out_t*)b;
+	if (x->start != y->start) return x->start < y->start? -1 : 1;
+	return (int)x->strand - (int)y->strand;
+}
+
+// Drain the maximal-scoring segments of one finished interior block into out[], then reset rt.
+static void telo_drain(telo_rt_t *rt, char strand, telo_out_t **out, int *n, int *m, int len, int64_t lo, int min_score)
+{
+	int k;
+	for (k = 0; k < rt->n; ++k) {
+		int64_t sc = rt->a[k].R - rt->a[k].L;
+		if (sc < min_score) continue;
+		if (*n == *m) { *m = *m? *m<<1 : 16; *out = (telo_out_t*)realloc(*out, *m * sizeof(telo_out_t)); }
+		(*out)[*n].start = rt->a[k].start - (len - 1) > lo? rt->a[k].start - (len - 1) : lo;
+		(*out)[*n].end = rt->a[k].end + 1;
+		(*out)[*n].score = sc;
+		(*out)[*n].strand = strand;
+		(*out)[*n].partner = -1;
+		++*n;
+	}
+	rt->n = 0, rt->prefix = 0;
+}
+
+// Return a malloc'd canonical form of the motif: the lexicographically smaller of the motif
+// and its reverse complement (whole strings, no re-rotation). Matches seqtk's default CCCTAA
+// (= the lex-lower of CCCTAA/TTAGGG), so e.g. TTAGGG -> CCCTAA, TTTAGGG -> CCCTAAA.
+static char *telo_canon(const char *motif, int len)
+{
+	char *rc = (char*)malloc(len + 1), *out = (char*)malloc(len + 1);
+	int i;
+	for (i = 0; i < len; ++i) {
+		int c = seq_nt6_table[(uint8_t)motif[len - 1 - i]];
+		rc[i] = "?ACGTN"[c >= 1 && c <= 4? 5 - c : c];
+	}
+	rc[len] = 0;
+	strcpy(out, strcmp(motif, rc) <= 0? motif : rc);
+	free(rc);
+	return out;
+}
+
 int stk_telo(int argc, char *argv[])
 {
 	gzFile fp;
 	kseq_t *seq;
-	char *telo_seq = "CCCTAA";
-	int c, i, j, len, absent, show_profile = 0, penalty = 1, max_drop = 2000, min_score = 300;
+	char *telo_seq = "CCCTAA", *rc_seq = 0;
+	int c, i, j, len, absent, show_profile = 0, show_internal = 0, show_verbose = 0, penalty = 1, max_drop = 2000, min_score = 300;
 	uint64_t x, mask, sum_input = 0, sum_telo = 0;
-	khash_t(64) *h;
+	khash_t(64) *h, *h_rc = 0;
 
-	while ((c = getopt(argc, argv, "m:p:d:s:P")) >= 0) {
+	while ((c = getopt(argc, argv, "m:p:d:s:Piv")) >= 0) {
 		if (c == 'm') telo_seq = optarg;
 		else if (c == 'p') penalty = atoi(optarg);
 		else if (c == 'd') max_drop = atoi(optarg);
 		else if (c == 's') min_score = atoi(optarg);
 		else if (c == 'P') show_profile = 1;
+		else if (c == 'i') show_internal = 1;
+		else if (c == 'v') show_verbose = 1;
 	}
 	if (penalty < 0) penalty = -penalty;
 	if (argc == optind && isatty(fileno(stdin))) {
@@ -1991,11 +2065,21 @@ int stk_telo(int argc, char *argv[])
 		fprintf(stderr, "  -d INT     max drop [%d]\n", max_drop);
 		fprintf(stderr, "  -s INT     min score [%d]\n", min_score);
 		fprintf(stderr, "  -P         print scoring\n");
+		fprintf(stderr, "  -i         internal: also report interstitial telomere arrays\n");
+		fprintf(stderr, "             (motif is auto-canonicalized to the lex-lower strand, so + is stable)\n");
+		fprintf(stderr, "             adds a 5th column: 5p/3p for the default terminal telomeres,\n");
+		fprintf(stderr, "             internal+/internal- for interior arrays (+ motif, - revcomp);\n");
+		fprintf(stderr, "             a telomere-Ns-telomere junction is one row 'internalX annealedY'\n");
+		fprintf(stderr, "             (X = strand before the N-gap, Y = strand after it); a terminal\n");
+		fprintf(stderr, "             telomere spanning an N-gap is '5p annealed+'/'3p annealed-';\n");
+		fprintf(stderr, "             `-i out | grep -v internal | cut -f1-4` == default output\n");
+		fprintf(stderr, "  -v         with -i, append a 6th column with each array's score\n");
 		return 1;
 	}
 
 	len = strlen(telo_seq);
 	mask = (1ULL<<2*len) - 1;
+	if (show_internal) telo_seq = telo_canon(telo_seq, len); // -i: canonicalize strand so + is always the lex-lower (C-rich) motif
 
 	h = kh_init(64); // hash table for all roations of the telomere motif
 	kh_resize(64, h, len * 2);
@@ -2008,12 +2092,152 @@ int stk_telo(int argc, char *argv[])
 		kh_put(64, h, x, &absent);
 	}
 
+	if (show_internal) { // build a second hash for all rotations of the reverse-complement motif
+		rc_seq = (char*)malloc(len + 1);
+		for (i = 0; i < len; ++i) {
+			int c = seq_nt6_table[(uint8_t)telo_seq[len - 1 - i]];
+			assert(c >= 1 && c <= 4);
+			rc_seq[i] = "?ACGTN"[5 - c]; // complement: A<->T, C<->G
+		}
+		rc_seq[len] = 0;
+		h_rc = kh_init(64);
+		kh_resize(64, h_rc, len * 2);
+		for (i = 0; i < len; ++i) {
+			for (j = 0, x = 0; j < len; ++j) {
+				int cc = seq_nt6_table[(uint8_t)rc_seq[(i + j) % len]];
+				x = x<<2 | (cc-1);
+			}
+			kh_put(64, h_rc, x, &absent);
+		}
+	}
+
 	fp = argc > 1 && strcmp(argv[optind], "-")? gzopen(argv[optind], "r") : gzdopen(fileno(stdin), "r");
 	if (fp == 0) {
 		fprintf(stderr, "[E::%s] failed to open the input file/stream.\n", __func__);
 		return 1;
 	}
 	seq = kseq_init(fp);
+	if (show_internal) {
+		telo_rt_t rt_f = {0,0,0,0}, rt_r = {0,0,0,0};
+		telo_out_t *out = 0;
+		int n_out = 0, m_out = 0;
+		while (kseq_read(seq) >= 0) {
+			ssize_t i;
+			int l;
+			int64_t end5 = 0, start3 = seq->seq.l; // Heng Li's 5'/3' telomere boundaries
+			int64_t score5 = 0, score3 = 0;
+			int anneal5 = 0, anneal3 = 0; // terminal absorbed a telomere-Ns-telomere junction
+			sum_input += seq->seq.l;
+			{ // replicate the default-mode end-anchored scans to locate the terminal telomeres
+				ssize_t bi, bmi;
+				int bl;
+				int64_t bsc, bmax;
+				bsc = bmax = 0, bmi = -1;
+				for (bi = 0, bl = 0, x = 0; bi < seq->seq.l; ++bi) { // 5'-end, CCCTAA
+					int hit = 0, c = seq_nt6_table[(uint8_t)seq->seq.s[bi]];
+					if (c >= 1 && c <= 4) { x = (x<<2 | (c-1)) & mask; if (++bl >= len && kh_get(64, h, x) != kh_end(h)) hit = 1; }
+					else bl = 0, x = 0;
+					if (bi >= len) bsc += hit? 1 : -penalty;
+					if (bsc > bmax) bmax = bsc, bmi = bi;
+					else if (bmax - bsc > max_drop) break;
+				}
+				if (bmax >= min_score) end5 = bmi + 1, score5 = bmax;
+				bsc = bmax = 0, bmi = -1;
+				for (bi = seq->seq.l - 1, bl = 0, x = 0; bi >= end5; --bi) { // 3'-end, revcomp
+					int hit = 0, c = seq_nt6_table[(uint8_t)seq->seq.s[bi]];
+					if (c >= 1 && c <= 4) { x = (x<<2 | (4-c)) & mask; if (++bl >= len && kh_get(64, h, x) != kh_end(h)) hit = 1; }
+					else bl = 0, x = 0;
+					if (seq->seq.l - bi >= len) bsc += hit? 1 : -penalty;
+					if (bsc > bmax) bmax = bsc, bmi = bi;
+					else if (bmax - bsc > max_drop) break;
+				}
+				if (bmax >= min_score) start3 = bmi, score3 = bmax;
+			}
+			// A terminal telomere spanning an N-run absorbed a telomere-Ns-telomere junction (the 5'
+			// scan can only bridge a gap via a + telomere, the 3' via -); flag it as 5p/3p annealed.
+			{
+				ssize_t k;
+				for (k = 0; k < end5; ++k) if (!(seq_nt6_table[(uint8_t)seq->seq.s[k]] >= 1 && seq_nt6_table[(uint8_t)seq->seq.s[k]] <= 4)) { anneal5 = 1; break; }
+				for (k = start3; k < seq->seq.l; ++k) if (!(seq_nt6_table[(uint8_t)seq->seq.s[k]] >= 1 && seq_nt6_table[(uint8_t)seq->seq.s[k]] <= 4)) { anneal3 = 1; break; }
+			}
+			// Scan the interior, but split telomere arrays at N-runs (a scaffold gap is a hard
+			// boundary; without this two same-strand arrays across a gap would merge into one).
+			n_out = 0;
+			rt_f.n = rt_r.n = 0, rt_f.prefix = rt_r.prefix = 0;
+			{
+				int64_t (*nr)[2] = 0, ns = -1; // N-runs [start,end); ns = current N-run start (-1 = none)
+				int n_nr = 0, m_nr = 0, g, a, b, tol = 30; // tol: allow a few non-telomere bp between a telomere and the N-gap
+				for (i = end5, l = 0, x = 0; i <= start3; ++i) {
+					int c = i < start3? seq_nt6_table[(uint8_t)seq->seq.s[i]] : 0;
+					if (i < start3 && c >= 1 && c <= 4) { // a base
+						if (ns >= 0) { // close the N-run we were in
+							if (n_nr == m_nr) { m_nr = m_nr? m_nr<<1 : 8; nr = realloc(nr, m_nr * sizeof(*nr)); }
+							nr[n_nr][0] = ns, nr[n_nr][1] = i, ++n_nr, ns = -1;
+						}
+						x = (x<<2 | (c-1)) & mask;
+						if (l < len) ++l;
+						{
+							int sf = 0, sr = 0;
+							if (l >= len) {
+								sf = kh_get(64, h, x)    != kh_end(h)?    1 : -penalty;
+								sr = kh_get(64, h_rc, x) != kh_end(h_rc)? 1 : -penalty;
+							}
+							telo_rt_push(&rt_f, sf, i);
+							telo_rt_push(&rt_r, sr, i);
+						}
+					} else if (ns < 0) { // N-run start (or interior end): flush the finished block
+						telo_drain(&rt_f, '+', &out, &n_out, &m_out, len, end5, min_score);
+						telo_drain(&rt_r, '-', &out, &n_out, &m_out, len, end5, min_score);
+						l = 0, x = 0, ns = i;
+					}
+				}
+				qsort(out, n_out, sizeof(telo_out_t), telo_out_cmp);
+				// An annealed junction is telomere-Ns-telomere: an array abutting the left of an N-run
+				// (end == gap start) paired with one abutting the right (start == gap end).
+				for (g = 0; g < n_nr; ++g) {
+					int bi = -1, ai = -1;
+					for (a = 0; a < n_out; ++a) if (out[a].partner == -1 && out[a].end <= nr[g][0] && nr[g][0] - out[a].end <= tol) bi = a;
+					for (b = 0; b < n_out; ++b) if (out[b].partner == -1 && out[b].start >= nr[g][1] && out[b].start - nr[g][1] <= tol) { ai = b; break; }
+					if (bi >= 0 && ai >= 0 && bi != ai) out[bi].partner = ai, out[ai].partner = -2;
+				}
+				free(nr);
+			}
+			// Emit terminals verbatim (so `grep -v internal | cut -f1-4` reproduces default output), interior arrays in between.
+			if (end5 > 0) {
+				printf("%s\t0\t%ld\t%ld\t5p%s", seq->name.s, (long)end5, (long)seq->seq.l, anneal5? " annealed+" : "");
+				if (show_verbose) printf("\t%ld", (long)score5);
+				putchar('\n');
+				sum_telo += end5;
+			}
+			for (j = 0; j < n_out; ++j) {
+				if (out[j].partner == -2) continue; // 'after' half of a junction, emitted with its 'before'
+				if (out[j].partner >= 0) { // annealed junction: one row, two sub-components
+					telo_out_t *a2 = &out[out[j].partner];
+					printf("%s\t%ld\t%ld\t%ld\tinternal%c annealed%c", seq->name.s, (long)out[j].start, (long)a2->end, (long)seq->seq.l, out[j].strand, a2->strand);
+					if (show_verbose) printf("\t%ld", (long)(out[j].score + a2->score));
+					putchar('\n');
+					sum_telo += (out[j].end - out[j].start) + (a2->end - a2->start);
+				} else { // lone interior array
+					printf("%s\t%ld\t%ld\t%ld\tinternal%c", seq->name.s, (long)out[j].start, (long)out[j].end, (long)seq->seq.l, out[j].strand);
+					if (show_verbose) printf("\t%ld", (long)out[j].score);
+					putchar('\n');
+					sum_telo += out[j].end - out[j].start;
+				}
+			}
+			if (start3 < seq->seq.l) {
+				printf("%s\t%ld\t%ld\t%ld\t3p%s", seq->name.s, (long)start3, (long)seq->seq.l, (long)seq->seq.l, anneal3? " annealed-" : "");
+				if (show_verbose) printf("\t%ld", (long)score3);
+				putchar('\n');
+				sum_telo += seq->seq.l - start3;
+			}
+		}
+		free(out); free(rt_f.a); free(rt_r.a);
+		kh_destroy(64, h); kh_destroy(64, h_rc); free(rc_seq);
+		kseq_destroy(seq);
+		gzclose(fp);
+		fprintf(stderr, "%ld\t%ld\t%s\n", (long)sum_telo, (long)sum_input, telo_seq); // telo_seq is the canonical motif under -i
+		return 0;
+	}
 	while (kseq_read(seq) >= 0) {
 		ssize_t i, l, max_i = -1, st = 0;
 		int64_t score, max;
