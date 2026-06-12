@@ -1,3 +1,24 @@
+Fork addition (jbh-cas)
+-----------------------
+
+ * New feature: added option `-i` to the `telo` command for genome-wide
+   internal telomere detection. Reports all telomere arrays (terminal AND
+   interstitial) on both strands with a strand-tagged class column. A
+   telomere-Ns-telomere junction (the scaffold "annealed" pattern, e.g. from
+   dual-scaf joins) is reported as one row `internalX annealedY`. A terminal
+   telomere that absorbed such a junction across an N-gap is tagged
+   `5p annealed+` or `3p annealed-`. The motif is auto-canonicalized to the
+   lex-lower strand under `-i` so `+` is stable regardless of which strand of
+   `-m` is supplied. Default `telo` behaviour (no `-i`) is byte-for-byte
+   identical to upstream r133.
+
+ * New feature: added option `-v` (effective with `-i`) to append each
+   array's score as a 6th column.
+
+ * Invariant maintained against upstream:
+   `seqtk telo -i F | grep -v internal | cut -f1-4` == `seqtk telo F`.
+
+
 Release 1.5-r133 (1 June 2025)
 ------------------------------
 

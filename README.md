@@ -62,3 +62,8 @@ Seqtk Examples
 * Find telomere (TTAGGG)n repeats:
 
         seqtk telo seq.fa > telo.bed 2> telo.count
+
+* Find telomere repeats genome-wide, including interstitial arrays and annealed
+  scaffold junctions (this fork's `-i`; see NEWS.md):
+
+        seqtk telo -i seq.fa > telo.bed 2> telo.count
