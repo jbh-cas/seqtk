@@ -2066,13 +2066,13 @@ int stk_telo(int argc, char *argv[])
 		fprintf(stderr, "  -s INT     min score [%d]\n", min_score);
 		fprintf(stderr, "  -P         print scoring\n");
 		fprintf(stderr, "  -i         internal: also report interstitial telomere arrays\n");
-		fprintf(stderr, "             (motif is auto-canonicalized to the lex-lower strand, so + is stable)\n");
-		fprintf(stderr, "             adds a 5th column: 5p/3p for the default terminal telomeres,\n");
-		fprintf(stderr, "             internal+/internal- for interior arrays (+ motif, - revcomp);\n");
-		fprintf(stderr, "             a telomere-Ns-telomere junction is one row 'internalX annealedY'\n");
-		fprintf(stderr, "             (X = strand before the N-gap, Y = strand after it); a terminal\n");
-		fprintf(stderr, "             telomere spanning an N-gap is '5p annealed+'/'3p annealed-';\n");
-		fprintf(stderr, "             `-i out | grep -v internal | cut -f1-4` == default output\n");
+//		fprintf(stderr, "             (motif is auto-canonicalized to the lex-lower strand, so + is stable)\n");
+//		fprintf(stderr, "             adds a 5th column: 5p/3p for the default terminal telomeres,\n");
+//		fprintf(stderr, "             internal+/internal- for interior arrays (+ motif, - revcomp);\n");
+//		fprintf(stderr, "             a telomere-Ns-telomere junction is one row 'internalX annealedY'\n");
+//		fprintf(stderr, "             (X = strand before the N-gap, Y = strand after it); a terminal\n");
+//		fprintf(stderr, "             telomere spanning an N-gap is '5p annealed+'/'3p annealed-';\n");
+//		fprintf(stderr, "             `-i out | grep -v internal | cut -f1-4` == default output\n");
 		fprintf(stderr, "  -v         with -i, append a 6th column with each array's score\n");
 		return 1;
 	}
